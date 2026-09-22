@@ -24,15 +24,22 @@
 
 ## B.3 路由层（ch10–ch13）
 
-- [ ] 一条 KV 事件从 vLLM 引擎到 radix tree 的完整通路（含 consolidator、
-      batching、dedup）。
-- [ ] "索引允许错、结果不允许错"——解释这个性质如何支撑整条链路的优化。
-- [ ] radix tree 插入/查询/驱逐三操作在 token 前缀场景的语义。
-- [ ] 五种 indexer 变体各自针对的问题。
-- [ ] 一次路由决策的全部输入与流水线顺序（过滤 → 打分）。
-- [ ] 模式降档排障法（kv → least-loaded → rr）的推理逻辑。
+- [ ] 一条 KV 事件从 vLLM 引擎到 radix tree 的完整通路（含 MM 归一化、
+      PlacementEvent 的 tier、批处理/去重、事件源的 etcd 发现注册）。
+- [ ] "索引允许错、结果不允许错"——解释这个性质如何支撑整条链路的优化，
+      并举出缺口检测/引擎重启/多记/少记各自的机制。
+- [ ] `RawKvEvent::BlockStored` 的字段清单里 `lora_name`、`cache_salt`、
+      `parent_block_hash` 各自为什么存在。
+- [ ] 块哈希身份 = Blake3 链接哈希 + 哪三重盐？keyed tracking 防什么攻击？
+- [ ] `SyncIndexer::find_matches` 的输入输出；`early_exit` 的意义。
+- [ ] `dump_tree_as_events` 为何足以充当快照机制。
+- [ ] **默写 ch12 打分公式**：缓存抵扣三层计价（1.0/0.75/0.25）、热点
+      衰减、decode 特例、taints 乘子、T=0 蓄水池破平与 T>0 softmax 采样。
+- [ ] 路由模式全集（7 种）与模式降档排障法；`DYN_ROUTER_*` 关键旋钮与默认值。
 - [ ] 两个"调度"（引擎内 vs Dynamo 路由）的边界。
-- [ ] lineage 驱逐相对 LRU 的适用条件。
+- [ ] FCFS vs WSPT 各优化什么目标函数？`router_queue_threshold` 何时触发排队？
+- [ ] 序列账本的生命周期方法；`router_track_output_blocks` 解决什么低估。
+- [ ] 准入（TinyLFU）与驱逐（fifo/lru/multi_lru/lineage）为什么是正交决策。
 
 ## B.4 分离与 KVBM（ch14–ch16）
 

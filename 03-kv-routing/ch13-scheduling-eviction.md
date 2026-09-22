@@ -1,131 +1,168 @@
-# 第 13 章 · 调度、驱逐与序列跟踪
+# 第 13 章 · 调度、驱逐与序列跟踪（源码深读版）
 
 > **适合谁读**：深入路由与容量管理的读者；这一章把第三部分收口。
 > **前置**：ch10–ch12。
-> **耗时**：40 分钟
+> **耗时**：55 分钟
 > **源码锚点**：commit `61e9184`（v1.5.0）。
 
 **学完能：**
-- 区分 Dynamo 的"路由调度"与引擎内部的"batch 调度"两个层次
-- 解释驱逐策略（FIFO/LRU/lineage）在 KVBM 逻辑层的角色
-- 描述序列跟踪（sequence tracking）如何支撑可观测性与在途容错
+- 解释 FCFS vs WSPT 两种队列策略各自优化的目标函数，知道何时切换
+- 说出路由侧序列跟踪记账的四个开关及其默认值、各自换什么
+- 区分"路由侧 TTL 记账"与"KVBM 驱逐后端"两级驱逐，并按行为选后端
 
 ---
 
-## 13.1 两个"调度"，不要混淆
+## 13.1 路由队列：FCFS vs WSPT
 
-| | 引擎内调度 | Dynamo 路由调度 |
-|---|-----------|----------------|
-| 对象 | batch 里放哪些序列、每步算什么 | 请求发给哪个 worker |
-| 位置 | vLLM/SGLang 内部（参见 vLLM 手册） | `lib/kv-router/src/scheduling/` |
-| 时间尺度 | 每 step | 每请求 |
+ch12 的调用链里，`find_best_match` 之前请求要先过路由内建的调度队列
+（`SchedulerQueueActor`——公式日志注释里提过，打分在这个 actor 任务里执行）。
+策略由 `router_queue_policy` 选择（`scheduling/config.rs:454`）：
 
-Dynamo 不越权管引擎内部 batch；它在"请求 → worker"这一层做准入与排队：
+| 策略 | 算法 | 优化目标 | 备注 |
+|------|------|----------|------|
+| `fcfs`（默认） | 先来先服务 + 优先级加塞（`priority_jump`/`strict_priority`，ch12 输入） | **尾部 TTFT**（P99） | 长请求不会饿死，但平均等待差 |
+| `wspt` | 加权最短处理时间（Smith's rule）：按 `处理时间/权重` 升序 | **平均 TTFT** | 调度论经典结论 |
 
-```
-lib/kv-router/src/scheduling/
-├── queue.rs           # 队列抽象
-├── policy.rs          # FCFS / 优先级等策略
-├── policy_queue.rs    # 策略×队列组合
-├── filter.rs          # 准入过滤
-├── prefill_load.rs    # prefill 负载形态
-├── overlap.rs         # 分离模式的重叠调度
-└── selector/          # ch12 已讲的选择器
-```
+> Smith's rule 是单机调度里 `ΣwⱼCⱼ`（加权完成时间和）的最优解。映射到
+> 推理：短请求优先 → 平均 TTFT 下降；代价是长请求尾部变差。选哪个取决于
+> 你的 SLO 写的是 P50 还是 P99。配置注释原话：*"fcfs … optimizes tail TTFT.
+> wspt … optimizes average TTFT."*
 
-## 13.2 队列与策略
+**排队触发条件**是 `router_queue_threshold: Option<f64>`（默认 `None` =
+不排队，直接全走 ready）：设为 0.6 表示"所有候选 worker 的 prefill token
+水位都超过其 `max_num_batched_tokens` 的 60%"时请求进入队列而不是硬塞给
+最不忙的那个。配合 ch12 的 `QueueRejected` 出口，这是过载背压的第一道闸。
 
-`policy.rs` 提供可切换策略（FCFS、优先级类）。与 vLLM 内部调度同源的思考题：
-**优先级调度可能饿死低优先级**——Dynamo 的处理方式同样是aging/加权一类
-经典手段，具体以源码为准。`filter.rs` 在入队前做容量/健康过滤：满载的
-worker 不该再排队（与 ch12 的负载项二选一生效或叠加，取决于模式）。
+## 13.2 序列跟踪：路由的"在途账本"
 
-`overlap.rs` 是分离模式特供：prefill 完成的瞬间 decode 应立即接力，
-队列要允许"接力请求"插队——为 ch14 埋点。
+`KvRouter` 上的一组方法（`lib/llm/src/kv_router.rs:1862-1978`）就是账本的
+借贷方向：
 
-## 13.3 驱逐：谁扔 KV、按什么顺序扔
-
-驱逐发生在 **worker/KVBM 一侧**（索引只是记账，见 ch11）：
-
-```
-lib/kvbm-logical/src/pools/inactive/backends/
-├── fifo.rs
-├── lru_backend.rs
-├── multi_lru_backend.rs
-└── lineage/eviction.rs     # 谱系感知驱逐
-lib/kv-router/src/indexer/approximate_lru.rs   # 索引侧近似 LRU 视角
+```rust
+pub async fn add_request(&self, ...)                       // 请求被接受：登记在途
+pub async fn mark_prefill_completed(&self, request_id)     // prefill 完成（分离接力点）
+pub async fn free(&self, request_id)                       // 请求结束：释放
+pub async fn free_if_worker(&self, ...)                    // 仅当仍在原 worker 时释放（防误释放迁移后的序列）
+pub fn pending_count(&self) -> usize                       // 在途数
+pub fn pending_isl_tokens(&self) -> usize                  // 在途输入 token 数
 ```
 
-- **FIFO**：实现最简，冷启动/测试用。
-- **LRU（及 multi-LRU）**：按最后命中淘汰；`approximate_lru` 说明精确 LRU
-  的簿记成本在大规模下不可接受。
-- **lineage（谱系）**：利用"这个块是从哪条序列分叉出来的"家谱信息——
-  多轮对话的祖先块价值高（大概率被下一轮命中），叶子块价值低。这是
-  对话型负载相对纯 LRU 的关键改进。
+底层结构在 `lib/kv-router/src/sequences/`：`single.rs`（`ActiveSequences`，
+聚合视角单段跟踪）、`multi_worker.rs`（分离模式两段跟踪）、`block_tracker.rs`
+（块级）、`prompt_registry.rs`、`prefill_tracker.rs`（等待接力的 prefill 完成
+序列——ch14 的对接面）、`replica_sync.rs`（多路由副本间的账本同步，
+`router_replica_sync` 控制）。
 
-驱逐与路由的联动：worker 持续驱逐 → KV 事件（释放）→ 索引收缩 → 路由
-候选变化。**驱逐策略实际上是隐式的路由策略**——你扔掉的缓存决定了未来
-命中不了什么。
+四个记账开关（默认值见 `config.rs` Default impl）：
 
-## 13.4 序列跟踪
+| 开关 | 默认 | 语义 |
+|------|------|------|
+| `router_track_active_blocks` | true | 路由侧跟踪活跃块（`DYN_ROUTER_TRACK_ACTIVE_BLOCKS`） |
+| `router_track_prefill_tokens` | true | 在途 prefill token 计入负载（ch12 衰减公式吃的就是这个数） |
+| `router_track_output_blocks` | false | 生成期占位块跟踪：随输出推进按 `agent_hints.osl` 做**分数衰减**——预测"这条请求最终会占多少 KV" |
+| `router_assume_kv_reuse` | true | true=算真实块哈希；false=**随机哈希**（假设完全无复用，用于对照实验/无前缀负载下省哈希开销） |
+
+`router_track_output_blocks` 的思路值得咀嚼：decode 请求的 KV 占地是**持续
+增长**的，只看当前块数会系统性低估长生成请求。按输出进度向目标 osl 插值
+（fractional decay），让打分看到"将来会多大"。这与 KVBM 的 lineage 驱逐
+（13.4）构成同一思想在两端的实现：一个预测未来占地，一个尊重历史价值。
+
+**恢复**：`dump_events()`（`kv_router.rs:2237`）+ ch11 的
+`dump_tree_as_events()`——账本与索引都可导出重放；worker 侧还有 ch10 的
+恢复端点。`tests/fault_tolerance/` 验收这些路径。
+
+## 13.3 路由侧的"软驱逐"：TTL 记账
+
+没有 KV 事件时（`use_kv_events=false`），索引里的块记录靠
+`router_ttl_secs`（默认 **120.0** 秒）过期——纯时间衰减的乐观记账。
+有 KV 事件时（默认路径），块的生灭由事件驱动，TTL 不参与——
+**"驱逐"的真相在 worker 侧**，路由只是记账员。
+
+## 13.4 worker 侧驱逐：KVBM 后端
+
+真正扔 KV 的是 `lib/kvbm-logical/src/pools/inactive/backends/`：
 
 ```
-lib/kv-router/src/sequences/
-├── single.rs          # 单 worker 视角的序列状态
-├── multi_worker.rs    # 跨 worker（分离接力的序列两段）
-├── block_tracker.rs   # 块级跟踪
-├── prompt_registry.rs # prompt → 序列映射
-├── prefill_tracker.rs # prefill 段跟踪
-└── replica_sync.rs    # 副本间同步
-lib/llm/src/kv_router/indexer/    # LLM 侧：记录/查询/恢复
+backends/
+├── fifo.rs               # 先进先出
+├── lru_backend.rs        # LRU
+├── multi_lru_backend.rs  # 多队列 LRU（分代）
+├── hashmap_backend.rs    # 简单池
+├── lineage/eviction.rs   # 谱系感知驱逐
+└── reuse_policy.rs       # 复用策略
 ```
 
-序列跟踪回答："**这条请求现在走到哪了？**"——在聚合模式下是一段
-（worker-w 正在生成），在分离模式下是两段（prefill 段 + decode 段，见 ch14）。
+三个层次的选择逻辑：
 
-它的三个消费者：
+1. **FIFO/哈希池**：测试与语义最简场景。
+2. **LRU 家族**：按最近命中。`multi_lru` 是分代变体（近似"新宠/旧爱"分队列，
+   抗扫描污染——一遍顺序扫描不会把热前缀全冲掉）。
+3. **lineage（谱系）**：利用序列家谱（ch11 的链接哈希天然编码了"这块从哪条
+   序列分叉"）：多轮对话的**祖先块**（大概率被下一轮命中）保，**叶子块**
+   （一次性输出尾块）先扔。这是对话型负载相对纯 LRU 的关键增益。
 
-1. **可观测性**：在途序列数、阶段耗时（对接 ch21 指标）。
-2. **在途容错**：worker 崩溃时，跟踪记录告诉你哪些请求在途、prefill 是否
-   已完成、能否直接重路由（`lib/kv-router/src/recovery/` + 
-   `lib/llm/src/kv_router/indexer/` 的恢复逻辑；`tests/fault_tolerance/`
-   是验收）。
-3. **接力（handoff）**：`prefill_tracker.rs` 记录"prefill 完成但尚未被 decode
-   接走"的序列——分离模式的对接面。
+守门员是 `lib/kvbm-logical/src/tinylfu.rs`（TinyLFU 风格的**准入**而非驱逐）：
+新块想进缓存先过频率门槛——**"让不让他进来"和"把谁扔出去"是两个正交
+决策**， TinyLFU 准入 + LRU/lineage 驱逐组合使用。索引侧的对应物是
+`ApproximateCachePolicyKind`（`router_approximate_cache_policy`）与
+`KvIndexer::new_with_approximate_retention(...)`——路由索引的容量管理。
 
-## 13.5 容量视角：这一切拼成什么
+> **驱逐即路由**：现在你能精确说出这条因果链了——
+> 驱逐后端决定哪些块消失 → `BlockRemoved` 事件 → 索引摘记 → 下一次
+> `find_matches` 的 overlap 变小 → 打分重新洗牌。换驱逐策略 = 隐式改写
+> 未来所有请求的打分输入。
+
+## 13.5 两级驱逐全景
 
 ```mermaid
-flowchart LR
-    REQ[新请求] --> ADM[准入 filter]
-    ADM --> SEL[选择 selector]
+flowchart TD
+    REQ[新请求] --> ADM{router_queue_threshold<br/>排队判定}
+    ADM -->|过载| QUEUE[FCFS/WSPT 队列]
+    ADM -->|通过| SEL[ch12 打分选择]
     SEL --> W[worker]
-    W --> BM[KVBM 逻辑层<br/>块记账+驱逐]
-    BM -->|容量压力| EV[驱逐: lru/lineage]
-    EV -->|KV 释放事件| IDX[索引收缩]
-    IDX --> SEL
-    W -->|序列状态| ST[序列跟踪]
-    ST -->|故障时| REC[恢复/重路由]
+    W --> TIER{KVBM 层级决策}
+    TIER -->|容量水位| OFF[offload: GPU→CPU/SSD]
+    TIER -->|准入| TF[TinyLFU: 进不进]
+    TIER -->|容量回收| EV[驱逐后端: fifo/lru/multi_lru/lineage]
+    EV -->|BlockRemoved 事件| IDX[索引摘记]
+    OFF -->|StorageTier 事件| IDX2[索引分层记账]
+    IDX & IDX2 --> SEL
+    SEQ[序列跟踪<br/>add_request/free/输出块预测] --> SEL
+    SEQ -->|故障| REC[恢复: dump/重放/worker 恢复端点]
 ```
 
-容量不够时的两条出路：**本地驱逐腾地方**（本节）或**跨层下放**（CPU/SSD，
-ch16）或**扩容**（Planner，ch21）。驱逐策略质量决定了"扩容按钮"被按下去的
-频率。
+与入门视角相比，这里新加入的两块拼图：排队判定（13.1）和准入 vs 驱逐的分离（13.4）。
+
+## 13.6 配置速查（本章相关）
+
+| 旋钮 | 默认 | 环境 | 章 |
+|------|------|------|----|
+| `router_queue_policy` | fcfs | `DYN_ROUTER_QUEUE_POLICY` | 13.1 |
+| `router_queue_threshold` | None（不排队） | `DYN_ROUTER_QUEUE_THRESHOLD` | 13.1 |
+| `router_ttl_secs` | 120.0（仅无事件模式） | `DYN_ROUTER_TTL_SECS` | 13.3 |
+| `router_track_*` 四开关 | 见 13.2 表 | `DYN_ROUTER_TRACK_*` | 13.2 |
+| `router_replica_sync` | false | `DYN_ROUTER_REPLICA_SYNC` | 13.2 |
 
 ## 小结
 
-- 两个调度层次：引擎内 batch 调度（不归 Dynamo 管）与路由调度（本部分）。
-- 驱逐在 worker/KVBM 侧执行，策略谱系 FIFO→LRU→lineage，本质是隐式路由策略。
-- 序列跟踪支撑观测、容错、接力三个消费者，是第三与第四部分的桥。
+- 队列：fcfs 保尾部 / wspt 保平均，`router_queue_threshold` 是背压第一闸。
+- 账本：`add_request → mark_prefill_completed → free` 生命周期 + 四个记账
+  开关；输出块预测让打分看到"未来占地"。
+- 驱逐两级：路由侧 TTL 只是无事件模式的兜底；真驱逐在 KVBM——准入
+  （TinyLFU）与驱逐（fifo/lru/multi_lru/lineage）正交组合。
 
-## 自检（4 题，自答）
+## 自检（6 题，自答）
 
-1. "Dynamo 抢占了 vLLM 的 continuous batching"——这句话错在哪？
-2. lineage 驱逐为什么在多轮对话负载下优于纯 LRU？什么负载下无差别？
-3. 在途容错需要序列跟踪提供哪三个事实才能决定"重路由而不是重算"？
-4. 驱逐策略如何影响未来 5 分钟的路由命中率？用因果链回答。
+1. SLO 是 P99 TTFT，用 fcfs 还是 wspt？如果产品经理同时要 P50 呢？
+2. `router_queue_threshold=0.0` 与 `None` 的行为差异？
+3. `router_track_output_blocks=false` 时，长生成请求在打分里被如何系统性
+   误判？方向是什么？
+4. TinyLFU 是驱逐策略吗？它和 lru_backend 是什么关系？
+5. `free_if_worker` 为什么要带 worker 条件？联系 ch14 的迁移场景回答。
+6. 设计一个实验证明"lineage 优于 LRU"：负载怎么构造、看什么指标？
 
 ## 下一步（跳转推荐）
 
-- → [ch14 PD 分离架构](../04-disagg/ch14-pd-disagg.md)（序列两段化）
-- → [ch16 KVBM](../04-disagg/ch16-kvbm.md)（驱逐的完整版）
+- → [ch14 PD 分离架构](../04-disagg/ch14-pd-disagg.md)（`prefill_tracker`
+  的另一半故事）
+- → [ch16 KVBM](../04-disagg/ch16-kvbm.md)（13.4 的完整展开）
