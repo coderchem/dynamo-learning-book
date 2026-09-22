@@ -33,6 +33,13 @@
   - [ch20 Kubernetes Operator 与 DGD](/06-deploy/ch20-operator-dgd.md)
   - [ch21 Planner 与可观测性](/06-deploy/ch21-planner-observability.md)
 
+- **第七部分 高级特性与测试**
+  - [ch22 多模态推理链路](/07-advanced/ch22-multimodal.md)
+  - [ch23 LoRA 适配器管理](/07-advanced/ch23-lora.md)
+  - [ch24 容错、迁移与恢复](/07-advanced/ch24-fault-tolerance.md)
+  - [ch25 共享缓存与跨数据中心 KV](/07-advanced/ch25-shared-cache-dc.md)
+  - [ch26 测试体系与 CI](/07-advanced/ch26-testing-ci.md)
+
 - **附录**
   - [A 术语表](/appendix/A-glossary.md)
   - [B 全书自检清单与常见误区](/appendix/B-self-check.md)

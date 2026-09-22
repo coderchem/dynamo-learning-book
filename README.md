@@ -43,9 +43,10 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 | 第四部分 分离式服务与 KV 传输 | PD 分离、NIXL 传输、KVBM 多层管理 | ch14–ch16 |
 | 第五部分 后端集成 | vLLM / SGLang / TensorRT-LLM 集成、Mocker 与压测 | ch17–ch19 |
 | 第六部分 部署与运维 | Kubernetes Operator 与 DGD、Planner 与可观测性 | ch20–ch21 |
+| 第七部分 高级特性与测试 | 多模态链路、LoRA、容错迁移、共享缓存与跨 DC、测试体系 | ch22–ch26 |
 | 附录 | 术语表、全书自检清单、常见误区 | A / B |
 
-全书完整读一遍约需 **13–19 小时**（不含动手实验；第三部分为源码深读版，
+全书完整读一遍约需 **16–23 小时**（不含动手实验；第三部分为源码深读版，
 打分公式与配置逐行核对过 `61e9184` 上的源码）。
 
 ## 四条学习路径
@@ -137,6 +138,13 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 ### 第六部分 部署与运维
 - [ch20 Kubernetes Operator 与 DGD](06-deploy/ch20-operator-dgd.md)
 - [ch21 Planner 与可观测性](06-deploy/ch21-planner-observability.md)
+
+### 第七部分 高级特性与测试
+- [ch22 多模态推理链路](07-advanced/ch22-multimodal.md)
+- [ch23 LoRA 适配器管理](07-advanced/ch23-lora.md)
+- [ch24 容错、迁移与恢复](07-advanced/ch24-fault-tolerance.md)
+- [ch25 共享缓存与跨数据中心 KV](07-advanced/ch25-shared-cache-dc.md)
+- [ch26 测试体系与 CI](07-advanced/ch26-testing-ci.md)
 
 ### 附录
 - [A 术语表](appendix/A-glossary.md)

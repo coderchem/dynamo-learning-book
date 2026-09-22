@@ -90,6 +90,27 @@ sequenceDiagram
 `--kv-cache-block-size` 类旗标控制，`frontend_args.py` 里可见默认值）。分词
 发生在前端而不是各 worker，保证"同一请求在各处看到的 token 序列一致"。
 
+### 工具调用与思考字段（阶段②的现代化细节）
+
+两类"非朴素 chat"的请求改写都发生在前处理：
+
+- **工具调用**：`lib/llm/src/preprocessor/tools/{mod,request}.rs` 把
+  messages 里的 `tools` 定义改写成模型可理解的提示词形态；响应侧的
+  `enable_streaming_tool_dispatch`（前端旗标，`frontend/main.py` 的
+  kwargs 里可见）控制工具调用片段在流式输出中的分发方式。
+- **思考字段（reasoning）**：`components/src/dynamo/frontend/thinking.py`
+  统一处理各家模型的思考开关——识别的控制键有四个：
+  `"thinking" / "enable_thinking" / "thinking_mode" / "reasoning_effort"`；
+  部署级默认值从模型 runtime 元数据的 `default_thinking_mode` 读取。
+  输出侧的 `reasoning_field_name` 与 `enable_streaming_reasoning_dispatch`
+  决定思考内容以什么字段名、什么粒度流出（对接 DeepSeek-R1 类模型的
+  `reasoning_content` 习惯）。
+
+这两组开关都在 `frontend_args.py` 有对应旗标，且属于"改的是提示词与
+输出包装、不动 token 计数主体"的前处理边界内——所以它们不影响 ch12
+的路由输入，除了一个例外：带思考模式的负载输出显著变长，记得回
+ch13 看 `router_track_output_blocks` 的输出占地预测。
+
 ## 9.4 gRPC 与其他表面
 
 - KServe v2：`lib/llm/src/grpc/service.rs` + `grpc/service/{openai,kserve,tensor}.rs`。

@@ -141,7 +141,79 @@ event-driven and approximate routing writes"*——事件写入是吞吐热点�
    最大值**。它补偿的正是 ch10 说过的"事件永远滞后"：刚路由出去的请求，
    其 KV 事件还没到，但侧索引已经"预记"了。TTL 到期未获真实事件确认则过期。
 
-## 11.6 从查询到打分的桥
+## 11.6 FlashIndexer 深读：两种数据结构与选型决策树
+
+`lib/kv-router/src/indexer/README.md`（408 行，标题就叫 **⚡ FlashIndexer**）
+是官方的设计文档，性能目标写着：**事件+请求合计吞吐 1000 万/秒、p99 延迟
+<10µs**。这里消化它的三个核心内容。
+
+### 四种块标识符（身份系统的精确版）
+
+| 标识符 | 类型 | 语义 |
+|--------|------|------|
+| `LocalBlockHash` | u64 | 块内 token 的哈希（可选混入 LoRA 名、MM 元数据），与上下文无关 |
+| `ExternalSequenceBlockHash` | u64 | 从序列头到本块的累积哈希：`seq[i]=hash(seq[i-1]‖local[i])`，定位"某条具体历史里的第 i 块" |
+| `WorkerWithDpRank` | — | 块在谁那里 |
+| `Position` | usize | 块在序列中的下标（跳跃优化的关键） |
+
+关键实践细节：**引擎提供的哈希优先**。TRT-LLM/vLLM 用自己的滚动哈希算
+序列哈希上报，路由不重算——RadixTree 只用 `LocalBlockHash` 导航、把
+序列哈希当不透明 id，所以兼容任意引擎算法；而 NestedMap 的惰性哈希
+优化需要自己增量算序列哈希，因此要么强制引擎用已知哈希、要么在中继层
+重算（这是选型的一个硬约束）。
+
+### RadixTree 内部结构
+
+```text
+RadixBlock
+├── edge: Vec<(LocalBlockHash, SeqHash)>        # 压缩边
+├── edge_index: HashMap<SeqHash, Position>
+├── worker_cutoffs: HashMap<Worker, Position>   # 每个 worker 在本节点的覆盖深度
+├── full_edge_workers: HashSet<Worker>
+└── children: HashMap<LocalBlockHash, Child>    # 按 LocalBlockHash 分叉
+```
+
+`find_matches` = 沿 `children` 下行，每步用 `worker_cutoffs` 与候选集
+求交，记录每个 worker 掉队的深度 → `{worker → depth}`。复杂度
+O(D×W)。并发版 `ConcurrentRadixTree` 把 `Rc<RefCell>` 换成
+`Arc<RwLock>`、查找表换 `DashMap`，写锁用手递手（hand-over-hand）；
+再套 `ThreadPoolIndexer`：**按 WorkerId 粘性路由到专属 OS 线程**（flume
+通道），同一 worker 的写天然串行化，跨线程无锁竞争——这是
+`router_event_threads=4`（ch10/12 提过）的落点。
+
+### PositionalIndexer（NestedMap）：位置优先 + 跳跃优化
+
+扁平结构 `DashMap<(Position, LocalHash), SeqEntry>`，`SeqEntry` 分
+`Single`（常态，一个序列哈希）/`Multi`（罕见，多前缀分叉到同块）两态
+省内存。杀手锏是 **jump optimization**：
+
+```text
+查询 [b0 ... b63 b64 ... b127 ...]
+      ↑                ↑              ↑
+    pos=0           pos=64         pos=128
+      └── 一次 O(1) 直查跳 64 格 ──┘
+         全员仍命中 → 继续跳；有人掉队 → 回扫 [64,128] 找精确掉队点
+```
+
+`find_matches` 从 O(D) 查找降到 **O(D/J)**（J=jump_size，如 32）；配合
+惰性哈希（Single 态跳过序列哈希计算）。代价：需要能增量算序列哈希
+（见上）。
+
+### 官方选型决策树
+
+| 形态 | 何时用 |
+|------|--------|
+| `RadixTree`（单线程） | worker 侧 `LocalKvIndexer`、单测；**路由侧禁用** |
+| `ConcurrentRadixTree`（CRT） | 单写多读、要简单 |
+| `ThreadPoolIndexer<CRT>`（CRTC） | **默认**；全员扫描到 ~1000 worker 为止 |
+| `BranchShardedIndexer<CRTC>`（BSI） | worker 数很大时按分叉分片，浅层路由 TRIE + 深层锚点分发；代价是**不支持近似修剪**（锚点一致性要求） |
+
+> BSI 的锚点设计是"correctness-first"的教科案例：跨分片派发前先在目标
+> 分片预装父锚点，避免"写入落在 A 分片、查询路由到 B 分片"的浅前缀
+> 失配。已知限制：静态分叉分配可能让热点分支挤在一个分片，自适应分裂
+> 是 future work。
+
+## 11.7 从查询到打分的桥
 
 把三件事串起来（ch10 → 本章 → ch12）：
 
@@ -160,7 +232,7 @@ flowchart LR
 ——这就是 ch12 里 `overlap_blocks: u32` 与
 `effective_overlap_blocks: f64` 并存的原因。
 
-## 11.7 动手实验（升级版）
+## 11.8 动手实验（升级版）
 
 1. **观察滞后与预测补偿**：mocker 环境 `--router-mode kv`，高并发发同前缀
    请求，对比 `DYN_ROUTER_PREDICTED_TTL_SECS=30` 前后的命中率变化。
