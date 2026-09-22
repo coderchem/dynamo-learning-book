@@ -146,6 +146,10 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 - [ch25 共享缓存与跨数据中心 KV](07-advanced/ch25-shared-cache-dc.md)
 - [ch26 测试体系与 CI](07-advanced/ch26-testing-ci.md)
 
+### 备考资料
+- [导学-Dynamo（面试导向学习路径）](导学-Dynamo.md)
+- [面经-Dynamo（题库与追问链，19 主问 + 38 追问）](面经-Dynamo.md)
+
 ### 附录
 - [A 术语表](appendix/A-glossary.md)
 - [B 全书自检清单与常见误区](appendix/B-self-check.md)
