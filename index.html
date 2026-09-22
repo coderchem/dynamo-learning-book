@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Dynamo 代码级中文学习手册 —— 编排层、KV 感知路由、PD 分离、KVBM、K8s 部署" />
+  <title>Dynamo 学习手册</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/docsify@4/lib/themes/vue.css" />
+  <style>
+    body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .sidebar .sidebar-name { color: #76b900; }
+    .mermaid { display: flex; justify-content: center;
+               background: #fff; border-radius: 6px; padding: 8px; margin: 8px 0; }
+    .content { max-width: 980px; }
+  </style>
+</head>
+<body>
+  <div id="app">加载中……（需要联网加载 CDN 资源）</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: "default" });
+
+    window.$docsify = {
+      name: "Dynamo 学习手册",
+      nameLink: "/README.md",
+      repo: "https://github.com/coderchem/dynamo-learning-book",
+      themeColor: "#76b900",
+      loadSidebar: true,
+      subMaxLevel: 2,
+      auto2top: true,
+      relativePath: true,
+      search: {
+        maxAge: 86400000,
+        paths: "auto",
+        placeholder: { "/": "全文搜索" },
+        noData: { "/": "没有匹配结果" },
+        depth: 3
+      },
+      markdown: {
+        renderer: {
+          code: function (code, lang) {
+            if (lang === "mermaid") {
+              return '<div class="mermaid">' + code + "</div>";
+            }
+            return this.origin.code.apply(this, [code, lang]);
+          }
+        }
+      },
+      plugins: [
+        function (hook) {
+          hook.doneEach(function () {
+            if (window.mermaid && window.mermaid.run) {
+              window.mermaid
+                .run({ querySelector: ".mermaid" })
+                .catch(function (e) { console.warn("mermaid render:", e); });
+            }
+          });
+        }
+      ]
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/docsify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/plugins/search.min.js"></script>
+</body>
+</html>
