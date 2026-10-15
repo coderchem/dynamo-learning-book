@@ -146,6 +146,61 @@ sequenceDiagram
 `LocalModel::fetch` → `hub.rs::from_hf`（mocker 场景 `ignore_weights=true`，
 只要 tokenizer 不要权重），前端就有一份本地 MDC 了。
 
+### MDC 的内容：一张"文件指针清单 + 能力声明表"
+
+MDC **不把模型文件内容塞进 etcd**——它的字段要么是元数据文件的指针
+（`CheckedFile`：本地路径或 URL + 校验和），要么是 worker 对自身能力的
+声明。前端拿卡后按指针取文件、按声明搭管线。结构体定义在
+`lib/llm/src/model_card.rs:834`（serde 序列化为 JSON 广播），按功能分六组：
+
+**① 身份与命名**：`display_name`（人类可读名）、`source_path`（原始 HF
+仓库路径，`--served-model-name` 改名后仍保留下载来源）、`aliases`（模型
+别名，用别名请求也路由到该 worker）、`lora`（`LoraInfo{name,
+max_gpu_lora_count}`，`model_card.rs:983`）。
+
+**② 元数据文件槽**（5 个类型化槽 + 兜底，这是前处理原料的真正来源）：
+
+| 槽 | 类型 | 指向 |
+|----|------|------|
+| `model_info` | `HfConfigJson` | `config.json`（判定 Kimi/DeepSeek 原生 formatter 的 `model_type` 就在这） |
+| `tokenizer` | `TokenizerKind`（`:269`） | `tokenizer.json` 或 tiktoken `.model` |
+| `prompt_formatter` | `HfTokenizerConfigJson` | `tokenizer_config.json`——chat template 通常在这里 |
+| `chat_template_file` | `HfChatTemplateJinja{is_custom}` / `HfChatTemplateJson`（`:312`） | 单独模板文件（Llama-4 风格或 `--chat-template` 自定义） |
+| `gen_config` | `GenerationConfig` | 默认采样参数 |
+| `extra_files` | `Vec<CheckedFile>` | 兄弟文件（`preprocessor_config.json`、`special_tokens_map.json` 等，凑齐 Python `from_pretrained()` 要的完整模型目录） |
+
+**③ 能力声明**（worker 拓扑，路由与就绪判定都读这里）：`model_type`
+（chat/completions/embedding）、**`model_input`**（`Tokens`=引擎期望
+预处理好的输入、前端必须分词；`Text`=引擎自己管——"前端分词"约定的
+来源）、`worker_type`（Prefill/Decode/Encode/Aggregated，不声明视为
+未就绪）、`needs`（DNF 依赖：外层 OR 内层 AND，如 Encode 声明
+`[[Prefill,Decode],[Aggregated]]`）、`kv_cache_block_size`（路由器块哈希
+的切块单位）、`migration_limit`（断连后请求最多迁移次数）。
+
+**④ `runtime_config`**（`ModelRuntimeConfig`，`local_model/runtime_config.rs:201`，
+引擎侧声明）：容量类（`context_length`/`total_kv_blocks`/
+`max_num_seqs`/`max_num_batched_tokens`）；解析器类（`tool_call_parser`/
+`reasoning_parser`/`tool_call_arguments_format`——GLM 系要 `JsonObject`）；
+tokenizer 覆盖（`tokenizer_backend`/`tokenizer_fallback_enabled`，优先级
+高于前端的环境变量）；结构化输出三件套（`structural_tag_*`）；KV 类
+（`kv_event_publishing_enabled`/`kv_state_endpoint`/`enable_local_indexer`）；
+数据并行（`data_parallel_*`）；`disaggregated_endpoint`（prefill 发布的
+P/D 引导端点，见 ch14）；`runtime_data`——引擎特定的自由 KV（vLLM 的
+`stream_interval`、9.3 五步流水里 token 预算准入策略都从这里读）。
+
+**⑤ 多模态与路由覆盖**：`media_decoder`/`media_fetcher`（图片解码与
+取数）、`router_config`（该 worker-set 的路由覆盖，watcher 优先于前端
+全局配置）、`indexer_identity`（KV 索引器兼容/隔离）。
+
+**⑥ 完整性**：`mdcsum()`（惰性校验和，`watcher.rs:479` 用它判断"同一
+模型的新卡内容是否真的变了"，文件没变就不重建管线）。
+
+两个易误解点：**文件本体怎么传**——`CheckedFile` 注册时是三种形态之一：
+共享存储绝对路径、self-host 的 `http://<worker>/v1/metadata/...`（默认）、
+`hf://repo/...` URL（无共享存储时前端自己下载）；etcd 里始终只有指针 +
+校验和。**为什么带 checksum**——前端取回文件后可校验，保证 self-host
+端点或缓存给的文件与 worker 登记时是同一份。
+
 ### `OpenAIPreprocessor`：一次请求的五步流水
 
 `preprocessor.rs:1548` 的 `OpenAIPreprocessor` 持有渲染所需的一切：
