@@ -44,6 +44,7 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 | 第五部分 后端集成 | vLLM / SGLang / TensorRT-LLM 集成、Mocker 与压测 | ch17–ch19 |
 | 第六部分 部署与运维 | Kubernetes Operator 与 DGD、Planner 与可观测性 | ch20–ch21 |
 | 第七部分 高级特性与测试 | 多模态链路、LoRA、容错迁移、共享缓存与跨 DC、测试体系 | ch22–ch26 |
+| 第八部分 专题深读 | 启动链路：命令如何变成服务（frontend 起 Rust、worker 起 vLLM） | ch27 |
 | 附录 | 术语表、全书自检清单、常见误区 | A / B |
 
 全书完整读一遍约需 **16–23 小时**（不含动手实验；第三部分为源码深读版，
@@ -52,8 +53,9 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 ## 四条学习路径
 
 1. **30 分钟速览**：ch02 → ch03 → ch04 的地标表 → 附录 A 术语表。
-2. **源码主线（推荐）**：跟随一个请求的生命周期——ch09（前端入口）→ ch12（路由
-   决策）→ ch17（vLLM 后端）→ 回头补 ch06–ch08（Runtime 三章）→ ch10–ch11（KV 索引）。
+2. **源码主线（推荐）**：跟随一个请求的生命周期——ch09（前端入口）→ ch27（启动
+   链路：命令怎么变成服务）→ ch12（路由决策）→ ch17（vLLM 后端）→
+   回头补 ch06–ch08（Runtime 三章）→ ch10–ch11（KV 索引）。
 3. **生产/运维线**：ch05（本地跑起来）→ ch14（PD 分离）→ ch16（KVBM）→ ch20（Operator
    与 DGD）→ ch21（Planner 与可观测性）→ 附录 B。
 4. **面试冲刺线**：ch01 → ch03 → ch11（radix tree 与前缀缓存）→ ch12 → ch14 → ch16，
@@ -79,6 +81,7 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 |------------|------|
 | 一个请求从 HTTP 进来到返回 | `lib/llm/src/http/service/openai.rs`（路由与处理器） |
 | 前端入口与启动流程 | `components/src/dynamo/frontend/main.py`（`main()` 在 495 行） |
+| 启动链路全解（命令→服务） | ch27 专题：`frontend/main.py:495`、`vllm/main.py:1012`、`lib/bindings/python/rust/lib.rs:1162` |
 | 组件/端点抽象 | `lib/runtime/src/component/component.rs`、`component/endpoint.rs` |
 | etcd / NATS / TCP / ZMQ 传输 | `lib/runtime/src/transports/` |
 | 服务发现与 worker 监视 | `lib/llm/src/discovery/watcher.rs`（`ModelWatcher`） |
@@ -145,6 +148,9 @@ LLM 推理概念的读者请先读第 1 章的预备知识。
 - [ch24 容错、迁移与恢复](07-advanced/ch24-fault-tolerance.md)
 - [ch25 共享缓存与跨数据中心 KV](07-advanced/ch25-shared-cache-dc.md)
 - [ch26 测试体系与 CI](07-advanced/ch26-testing-ci.md)
+
+### 第八部分 专题深读
+- [ch27 启动链路：一条命令如何变成一个服务](08-topics/ch27-startup-chain.md)
 
 ### 备考资料
 - [导学-Dynamo（面试导向学习路径）](导学-Dynamo.md)

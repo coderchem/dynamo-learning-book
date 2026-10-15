@@ -1,6 +1,6 @@
 # 导学-Dynamo（面试导向版）
 
-> 本导学是《Dynamo 学习手册》（本仓库，26 章）的**面试备战投影**：不复述全书，
+> 本导学是《Dynamo 学习手册》（本仓库，27 章）的**面试备战投影**：不复述全书，
 > 只回答"面大模型推理/推理基础设施岗，按什么顺序学、学到什么深度、去哪验证"。
 > 技术事实全部来自手册正文与 `ai-dynamo/dynamo@61e9184` 源码核对。
 > 配套题库见《面经-Dynamo.md》。
@@ -48,6 +48,7 @@
 |------|-----------|--------------|----------|----------------|
 | 架构定位 | 编排层 vs 引擎 | `01-overview/ch02-what-is-dynamo.md` | 25 min | 为什么有 Dynamo、边界在哪 |
 | 请求主线 | 请求八阶段 | `02-core/ch09-frontend-entry.md` | 50 min | 一个请求怎么走完 |
+| 启动链路 | 进程模型、PyO3 嵌入式运行时 | `08-topics/ch27-startup-chain.md` | 60 min | 一条命令怎么变成服务；Rust/Python 怎么配合（"是两个进程吗"高频题） |
 | 路由公式 | 代价模型 | `03-kv-routing/ch12-routing-decision.md` + `../lib/kv-router/src/scheduling/selector/default.rs` | 70 min | 打分每一项的含义与默认值 |
 | 索引 | 前缀树/跳跃优化 | `03-kv-routing/ch11-prefix-index.md` + `../lib/kv-router/src/indexer/README.md` | 60 min | 两种结构怎么选 |
 | 分离与传输 | 成本建模 | `04-disagg/ch14-pd-disagg.md`、`ch15-nixl-transfer.md` | 90 min | 何时分离划算、要搬多少字节 |

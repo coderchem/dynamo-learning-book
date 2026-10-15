@@ -40,6 +40,9 @@
   - [ch25 共享缓存与跨数据中心 KV](/07-advanced/ch25-shared-cache-dc.md)
   - [ch26 测试体系与 CI](/07-advanced/ch26-testing-ci.md)
 
+- **第八部分 专题深读**
+  - [ch27 启动链路：一条命令如何变成一个服务](/08-topics/ch27-startup-chain.md)
+
 - **备考资料**
   - [导学-Dynamo（面试导向学习路径）](/导学-Dynamo.md)
   - [面经-Dynamo（题库与追问链）](/面经-Dynamo.md)
