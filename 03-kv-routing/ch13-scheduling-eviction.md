@@ -179,10 +179,81 @@ flowchart TD
 | `router_track_*` 四开关 | 见 13.2 表 | `DYN_ROUTER_TRACK_*` | 13.2 |
 | `router_replica_sync` | false | `DYN_ROUTER_REPLICA_SYNC` | 13.2 |
 
+## 13.7 故障收口：一个 worker 挂了会发生什么
+
+这一节把第三部分的知识串成一条时间线——它同时是面经 Q17 的源码版。
+按四波展开（`lib/llm/src/migration.rs`、发现层、索引侧联动）。
+
+**第一波（秒级）：三条独立通道各自检测、各自摘除。** 没有中心化的
+"故障管理器"，worker 死掉时它持有的三样东西同时断——请求平面的流、
+ZMQ 事件源、etcd lease 心跳——三个消费者各管各的：
+
+1. **服务发现（etcd lease）**：worker 注册时 MDC、endpoint、`EventSource`
+   全挂在 lease 上（`registration.rs:64-114`）。进程死 → 心跳停 → lease
+   到期 → etcd 自动删键 → 前端/路由的 watch 收到 Deleted：
+   `watcher.rs:1202-1233` 发 `ModelUpdate::Removed` 摘除 worker_set，
+   负载表同步移除（`metrics.rs:460 remove_worker`）——它不再是打分候选。
+2. **事件面**：EventSource 随 lease 消失，KV 事件流自然断流。没有
+   "注销广播"，键没了就是没了。
+3. **请求平面**：投递给它的在途请求流断开/报错——引出第二波。
+
+**索引侧的清除：不是靠 KV 事件，也不能靠。** 死 worker 不会再发任何
+事件，所以摘除由发现层 Deleted 直接触发。对照两组 API（ch11）：
+
+| API | 触发源 | 语义 |
+|-----|--------|------|
+| `clear_all_blocks(worker_id)`（`radix_tree.rs:685`） | KV 事件 `Cleared` | worker 活着，主动清自己的账 |
+| `remove_worker`（`:665`）/ `remove_worker_dp_rank`（`:669`） | **发现层 Deleted** | worker 死了/注销，摘除持有标注 |
+
+`remove_worker` 的粒度要分清：**摘"持有标注"，不删节点**
+（`prompt_membership_trie.rs:51-58` 从每个节点摘
+`full_edge_workers`/`worker_cutoffs` 里这个 worker 的记录）——公共前缀
+节点可能同时被多个 worker 持有，摘掉死者、活人的共享前缀原样保留；摘完
+后无任何 worker 持有的空节点交给修剪机制（近似 LRU）回收。
+
+为什么必须摘、且不能用"尽力而为"兜底：平时索引多记无害的前提是
+worker 还活着（未命中重算）。worker 挂了缓存随进程消失，索引不摘的话
+路由会持续认为它"缓存最热"、**持续把请求派给死进程**。所以发现层摘除
+是**正确性相关**的强一致操作——这也是它挂在 etcd lease 而不是事件流上
+的原因。NATS 上已发出去的事件不用清（事件平面不存历史，消费即弃），
+真正被维护的是索引状态。worker 重启回来则是**新的临时 worker_id**
+（`stable_routing_id` 的文档注释："survive a new ephemeral `worker_id`"），
+旧 id 记录已摘、新 id 从零记账，互不污染。
+
+**第二波：在途请求迁移而非报错（in-flight fault tolerance）。** 前端的
+`RetryManager`（`migration.rs:373 next()`）盯着响应流：
+
+- 流报错 → `is_migratable_for_request`（`:93`）判定：错误类型可迁移且
+  **请求没被显式 pin**（分离接力 pin 的语义优先于迁移）；
+- 迁移 = `new_stream`（`:418`）**重建流**：重走 ch12 路由，带三样东西——
+  **失败排除表** `migration_state.excluded_worker_ids()`
+  （`kv_selection.rs:209-225` 白名单硬过滤，不选回刚挂的 worker）；
+  **已完成进度** `completed_tokens`（新 worker 把已生成部分当作 prompt
+  重新 prefill 再继续 decode，客户端的流无缝续上）；
+  **`migration_link`**（OTel 链接，新尝试的 span 链回失败 worker 的 span）；
+- 上限是 MDC 的 `migration_limit`（13.2 提过，0=禁用）——耗尽则
+  `record_migration_exhausted`，错误返回客户端；
+- 序列账本配套 `free_if_worker`（13.2）：只在请求仍在原 worker 时释放，
+  防止把已迁移请求的账划错。
+
+索引摘除、负载摘除、迁移排除是**三重保险**：前两个管"新请求别去"，
+第三个管"旧请求别回头"。
+
+**客户端视角**：迁移成功则流式输出无缝继续（代价是新 worker 重新
+prefill，TTFT 上升）；迁移耗尽或请求被 pin 则错误返回。
+
+**第三波（分钟级）：K8s 重建。** operator 重建 pod → 新 worker 注册新
+MDC、**新 publisher_id**（生死耦合干净开局）。两个预期行为别误判为故障：
+新 worker 的 KV 缓存是空的，本地索引恢复端点也帮不上忙（快照为空），
+overlap=0、靠负载项逐步吸引请求，**命中率短暂下降是设计内行为**；若该
+worker-set 的 `needs` DNF 依赖因此不满足（如 prefill 池唯一的 decode 伙伴
+没了），就绪门会拒绝为新流量背书。
+
 ## 面试指引：本章能答什么
 
 完整问答与追问链见[面经-Dynamo](../面经-Dynamo.md) **Q10**（队列策略）、
-**Q11**（驱逐体系）、**Q12**（在途跟踪与长请求占地）。
+**Q11**（驱逐体系）、**Q12**（在途跟踪与长请求占地）、**Q17**（worker
+挂了发生什么——13.7 是它的源码级完整版）。
 
 章内补充问法（面经未展开、答上就是加分项）：
 
@@ -202,13 +273,15 @@ flowchart TD
 
 - 一句话：忙不过来先挂单（挑平均还是保尾部看 SLO）；账本要记"将来
   会占多少"；冰箱管理 = 准入和驱逐两个正交决策，对话负载靠谱系。
+- worker 挂掉 = 四波时间线：lease 摘除（索引/负载）→ 在途请求迁移
+  （排除表+进度重放+migration_link）→ 三重保险 → 新 worker 新身份从零。
 - 队列：fcfs 保尾部 / wspt 保平均，`router_queue_threshold` 是背压第一闸。
 - 账本：`add_request → mark_prefill_completed → free` 生命周期 + 四个记账
   开关；输出块预测让打分看到"未来占地"。
 - 驱逐两级：路由侧 TTL 只是无事件模式的兜底；真驱逐在 KVBM——准入
   （TinyLFU）与驱逐（fifo/lru/multi_lru/lineage）正交组合。
 
-## 自检（6 题，自答）
+## 自检（8 题，自答）
 
 1. SLO 是 P99 TTFT，用 fcfs 还是 wspt？如果产品经理同时要 P50 呢？
 2. `router_queue_threshold=0.0` 与 `None` 的行为差异？
@@ -217,6 +290,10 @@ flowchart TD
 4. TinyLFU 是驱逐策略吗？它和 lru_backend 是什么关系？
 5. `free_if_worker` 为什么要带 worker 条件？联系 ch14 的迁移场景回答。
 6. 设计一个实验证明"lineage 优于 LRU"：负载怎么构造、看什么指标？
+7. worker 挂掉后，路由索引里它的记录靠什么清除？为什么不能等 KV 事件？
+   `remove_worker` 摘的是节点还是持有标注——为什么这样设计？
+8. 在途请求迁移时带上哪三样东西？migration_limit 耗尽后客户端看到什么？
+   被显式 pin 的请求为什么不迁移？
 
 ## 下一步（跳转推荐）
 
