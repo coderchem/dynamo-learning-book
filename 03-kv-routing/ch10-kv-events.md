@@ -363,12 +363,49 @@ pub enum KvCacheEventData {
   要支持，必须先发一条按 rank 有序的 `Cleared` 或换新 publisher_id——否则
   新引擎实例的块身份与旧索引记账对不上。排障见到"引擎重启后命中率异常"，
   先想到这里。
-- **恢复通道**：如果启用了 worker 本地索引（`LocalKvIndexer`），发布器还会
-  起一个 `start_worker_kv_query_endpoint`（`mod.rs:384`）——路由可以**主动
-  拉取**该 worker 的索引快照做恢复；起失败则广播"live-only KV source"（只
-  有实时流、无法回溯），路由侧降级而非崩溃。
+- **恢复通道**（详见下面 10.5.1）：worker 本地索引 `LocalKvIndexer` +
+  恢复查询端点，路由冷启动时"拉快照追赶、再追实时流"。
 - **优雅退出**：`Drop for KvEventPublisher` 触发 `shutdown()`：取消令牌、
   中止监听、从 etcd 注销事件源。
+
+### 10.5.1 为什么 worker 本地也有一个 indexer？
+
+系统里其实有**两份索引、两个主人**，别混为一谈：
+
+| | 路由侧索引（ch11 主角） | worker 侧 `LocalKvIndexer` |
+|---|---|---|
+| 在哪 | frontend 进程 | worker 进程内 |
+| 记什么 | **所有** worker 的块（全局视野） | **只有自己**的块 |
+| 服务谁 | "新请求派给谁" | 恢复快照 + 本地 KV 状态 |
+| 可信度 | 尽力而为（可能漏事件） | 永不漏（事件就是它发的，进程内落地） |
+
+源码注释直说定位：`lib/kv-router/src/indexer/local.rs:23` 开头写着
+**"Decentralized router: LocalKvIndexer for workers"**。它存在的三个理由：
+
+1. **恢复快照的提供者（最根本）**。事件流是单向广播、尽力而为、
+   **不可重放**——NATS 不存历史。路由重启或新路由副本加入时，错过的
+   事件永远收不回来，只能从"现在"开始听，冷启动期间索引为空、KV 感知
+   完全退化。解法是推拉结合：**推（广播）管实时，拉（恢复端点）管追赶**
+   ——`sinks.rs` "先应用本地索引再发布"就是给本地留一份永不漏的落地
+   副本；同时发布器起一个 Router→Worker 查询端点
+   （`recovery/worker_query_endpoint.rs`，`mod.rs:384`），路由启动后先向
+   worker 拉快照再追实时流。拉还是**增量协议**：请求带路由已有的
+   `last_event_id`（`WorkerKvQueryKind::RequiresDump`），worker 判断缓冲的
+   事件后缀能否覆盖缺口——能就只发增量，不能才全量 TreeDump，全量有
+   `CachedRecoverySnapshot` 缓存避免重复构建（`local.rs:29-47`）。端点起
+   失败则广播 "live-only KV source"（只有实时流、无法回溯），路由降级
+   而非崩溃。
+2. **最可信的权威副本**。路由索引可能因丢事件过期；worker 本地副本不经
+   网络、不可能漏自己的事件——恢复时**以 worker 侧为准**。这也解释了
+   10.3 的 fencing 语义：Cleared 复位本地索引失败 = 权威副本与对外通告
+   的游标分叉，只能整个事件源下线。
+3. **state agent v2 的地基**：KV 状态所有权与请求服务分离的去中心化
+   形态也建立在它之上（`state_agent.rs`，ch16）。
+
+配置 `enable_local_indexer` **默认 true**（`runtime_args.py:37`）。餐厅
+类比：领班有全店总账（全局索引），但每位厨师还有一本私人小账——新领班
+上任不用干等，直接找厨师抄小账，再接着听实时喊话；厨师的小账永不漏
+（喊话就是他发的），所以追赶时以小账为准。
 
 ## 10.6 另一条流：worker 负载指标
 
@@ -432,7 +469,7 @@ ch01 建立过"索引允许错、结果不允许错"的直觉，现在可以精�
 - 线格式字段即设计文档：parent 链、LoRA/命名空间盐、EAGLE 分组、位置重放。
 - 两条流分清楚：KV 事件（状态增量，进索引）vs 负载指标（快照，进打分）。
 
-## 自检（9 题，自答）
+## 自检（10 题，自答）
 
 1. KV 事件的第一产生者是谁？Dynamo 在链路里扮演什么角色？开启这条
    链路的前提开关是什么？
@@ -442,13 +479,15 @@ ch01 建立过"索引允许错、结果不允许错"的直觉，现在可以精�
    事件靠什么触发流动——定时器还是引擎行为？
 4. ZMQ 报文是几帧结构？payload 用什么序列化格式？引擎侧批序号和
    publisher 本地 event_id 是一回事吗？
-5. 引擎进程单独重启（Dynamo 发布器对象还在），为什么索引会出问题？
+5. 为什么 worker 本地还有一个 LocalKvIndexer？它和路由侧索引的分工、
+   可信度差异是什么？路由冷启动怎么靠它追赶（增量还是全量）？
+6. 引擎进程单独重启（Dynamo 发布器对象还在），为什么索引会出问题？
    规范的修复路径是什么？Cleared 复位本地索引失败时发布器怎么办？
-6. KVBM 把一块 KV 从显存下放到 CPU，事件流上发生了什么？（提示：
+7. KVBM 把一块 KV 从显存下放到 CPU，事件流上发生了什么？（提示：
    `publish_with_storage_tier`）
-7. 多模态部署里 `image_token_id` 不传会发生什么？症状会表现为什么？
-8. `ActiveLoad.active_prefill_tokens` 为什么不由 worker 上报？
-9. 批处理上限 128 块 + 15 秒强制截断，各自防的是什么病？
+8. 多模态部署里 `image_token_id` 不传会发生什么？症状会表现为什么？
+9. `ActiveLoad.active_prefill_tokens` 为什么不由 worker 上报？
+10. 批处理上限 128 块 + 15 秒强制截断，各自防的是什么病？
 
 ## 下一步（跳转推荐）
 
